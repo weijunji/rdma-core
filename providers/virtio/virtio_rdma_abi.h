@@ -32,66 +32,15 @@
  * SOFTWARE.
  */
 
-#ifndef __VIRTIO_RDMA_H__
-#define __VIRTIO_RDMA_H__
+#ifndef __UVIRTIO_RDMA_ABI_H__
+#define __UVIRTIO_RDMA_ABI_H__
 
-#include <linux/virtio_ring.h>
-
-#include <infiniband/driver.h>
 #include <infiniband/kern-abi.h>
-
 #include <rdma/virtio_rdma_abi.h>
+#include <kernel-abi/virtio_rdma_abi.h>
 
-#include "virtio.h"
-
-struct virtio_rdma_device {
-	struct verbs_device	ibv_dev;
-};
-
-struct virtio_rdma_context {
-	struct verbs_context	ibv_ctx;
-};
-
-struct virtio_rdma_cq {
-    struct verbs_cq		ibv_cq;
-
-    pthread_spinlock_t	lock;
-    struct virtio_rdma_cqe *queue;
-
-    uint32_t cqe_get;
-    uint32_t num_cqe;
-    size_t queue_size;
-};
-
-struct virtio_rdma_vring {
-    struct vring ring;
-    int index;
-
-    void* addr;
-    void* buf;
-    void* doorbell;
-};
-
-struct virtio_rdma_qp {
-    struct verbs_qp		ibv_qp;
-
-    int send_efd;
-    int recv_efd;
-
-    struct virtio_rdma_vring sq;
-    struct virtio_rdma_vring rq;
-};
-
-inline struct virtio_rdma_device* to_vdev(struct ibv_device* ibv_dev) {
-    return container_of(ibv_dev, struct virtio_rdma_device, ibv_dev.device);
-}
-
-inline struct virtio_rdma_context* to_vctx(struct ibv_context* ibv_ctx) {
-    return container_of(ibv_ctx, struct virtio_rdma_context, ibv_ctx.context);
-}
-
-inline struct virtio_rdma_cq* to_vcq(struct ibv_cq* ibv_cq) {
-    return container_of(ibv_cq, struct virtio_rdma_cq, ibv_cq.cq);
-}
-
+DECLARE_DRV_CMD(uvirtio_rdma_create_cq, IB_USER_VERBS_CMD_CREATE_CQ,
+		empty, virtio_rdma_create_cq_uresp);
+DECLARE_DRV_CMD(uvirtio_rdma_create_qp, IB_USER_VERBS_CMD_CREATE_QP,
+		virtio_rdma_create_qp_ureq, virtio_rdma_create_qp_uresp);
 #endif

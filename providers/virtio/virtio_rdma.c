@@ -42,17 +42,16 @@
 #include <pthread.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <errno.h>
 
-#include <endian.h>
-#include <pthread.h>
 #include <stddef.h>
 
 #include <infiniband/driver.h>
 #include <infiniband/verbs.h>
-#include <rdma/virtio_rdma_abi.h>
 
 #include "virtio_rdma.h"
+#include "virtio_rdma_abi.h"
 #include "virtio.h"
 
 static void virtio_rdma_free_context(struct ibv_context *ibctx);
@@ -162,17 +161,48 @@ static int virtio_rdma_dereg_mr(struct verbs_mr *vmr)
 	return 0;
 }
 
-static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *context,
-											 int cqe,
+static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
+											 int num_cqe,
 					    			  		 struct ibv_comp_channel *channel,
 					     			  		 int comp_vector)
 {
-	return NULL;
-}
+	struct virtio_rdma_cq *cq;
+	struct uvirtio_rdma_create_cq_resp resp;
+	int rc;
 
-static struct ibv_cq_ex* virtio_rdma_create_cq_ex (struct ibv_context *context,
-		            struct ibv_cq_init_attr_ex *init_attr)
-{
+	cq = calloc(1, sizeof(*cq));
+	if (!cq)
+		return NULL;
+
+	rc = ibv_cmd_create_cq(ctx, num_cqe, channel, comp_vector, &cq->ibv_cq.cq,
+			       NULL, 0, &resp.ibv_resp, sizeof(resp));
+	if (rc) {
+		printf("cq creation failed: %d\n", rc);
+		free(cq);
+		return NULL;
+	}
+
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
+	cq->num_cqe = resp.num_cqe;
+
+	cq->queue_size = resp.num_cqe * sizeof(*cq->queue);
+
+	cq->queue = mmap(NULL, cq->queue_size, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, ctx->cmd_fd, resp.offset);
+
+	printf("debug cq %s\n", (char*)cq->queue);
+
+	if (cq->queue == MAP_FAILED) {
+		printf("CQ mapping failed: %d", errno);
+		goto fail;
+	}
+
+	return &cq->ibv_cq.cq;
+
+fail:
+	ibv_cmd_destroy_cq(&cq->ibv_cq.cq);
+	free(cq);
+
 	return NULL;
 }
 
@@ -182,14 +212,91 @@ static int virtio_rdma_poll_cq (struct ibv_cq *cq, int num_entries,
 	return 0;
 }
 
-static int virtio_rdma_destroy_cq (struct ibv_cq *cq)
+static int virtio_rdma_destroy_cq (struct ibv_cq *ibcq)
 {
+	struct virtio_rdma_cq *cq = to_vcq(ibcq);
+	int rc;
+
+	rc = ibv_cmd_destroy_cq(ibcq);
+	if (rc)
+		return rc;
+
+	if (cq->queue_size)
+		munmap(cq->queue, cq->queue_size);
+	free(cq);
+
 	return 0;
 }
 
 static struct ibv_qp* virtio_rdma_create_qp (struct ibv_pd *pd,
 									  		 struct ibv_qp_init_attr *attr)
 {
+	struct virtio_rdma_qp *qp;
+	struct uvirtio_rdma_create_qp cmd;
+	struct uvirtio_rdma_create_qp_resp resp;
+	int rc;
+
+	qp = calloc(1, sizeof(*qp));
+	if (!qp)
+		return NULL;
+	
+	qp->send_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	qp->recv_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	cmd.send_eventfd = qp->send_efd;
+	cmd.recv_eventfd = qp->recv_efd;
+
+	rc = ibv_cmd_create_qp(pd, &qp->ibv_qp.qp, attr,
+			       &cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp, sizeof(resp));
+	if (rc) {
+		printf("qp creation failed: %d\n", rc);
+		free(qp);
+		return NULL;
+	}
+
+	qp->sq.addr = mmap(NULL, resp.sq_size, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, pd->context->cmd_fd, resp.sq_offset);
+	if (qp->sq.addr == MAP_FAILED) {
+		printf("QP mapping failed: %d\n", errno);
+		goto fail;
+	}
+
+	qp->sq.doorbell = qp->sq.addr;
+	qp->sq.index = resp.sq_idx;
+	*(__u16*)qp->sq.doorbell = htole16(qp->sq.index);
+
+	qp->rq.addr = mmap(NULL, resp.rq_size, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, pd->context->cmd_fd, resp.rq_offset);
+	if (qp->rq.addr == MAP_FAILED) {
+		printf("QP mapping failed: %d\n", errno);
+		goto fail;
+	}
+
+	qp->rq.doorbell = qp->rq.addr;
+	qp->rq.index = resp.rq_idx;
+	*(__u16*)qp->rq.doorbell = htole16(qp->rq.index);
+/*	
+	int getpagesize(void);
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
+	cq->num_cqe = resp.num_cqe;
+
+	cq->queue_size = resp.num_cqe * sizeof(*cq->queue);
+
+	cq->queue = mmap(NULL, cq->queue_size, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, ctx->cmd_fd, resp.offset);
+
+	printf("debug cq %s\n", (char*)cq->queue);
+
+	if (cq->queue == MAP_FAILED) {
+		printf("CQ mapping failed: %d", errno);
+		goto fail;
+	}
+*/
+	return &qp->ibv_qp.qp;
+
+fail:
+	ibv_cmd_destroy_qp(&qp->ibv_qp.qp);
+	free(qp);
+
 	return NULL;
 }
 
@@ -237,9 +344,7 @@ static const struct verbs_context_ops virtio_rdma_ctx_ops = {
 	.reg_mr = virtio_rdma_reg_mr,
 	.dereg_mr = virtio_rdma_dereg_mr,
 	.create_cq = virtio_rdma_create_cq,
-	.create_cq_ex = virtio_rdma_create_cq_ex,
 	.poll_cq = virtio_rdma_poll_cq,
-	.req_notify_cq = ibv_cmd_req_notify_cq,
 	.destroy_cq = virtio_rdma_destroy_cq,
 	// .create_srq = virtio_rdma_create_srq,
 	// .modify_srq = virtio_rdma_modify_srq,
