@@ -108,7 +108,7 @@ void vring_add_one(struct virtio_rdma_vring *vring,
 
 struct virtio_rdma_buf_pool_entry* vring_get_one(
         struct virtio_rdma_vring *vring) {
-    __u16 last_uesd;
+    __u16 last_used;
     __u16 idx;
 
     if (vring->last_used_idx == virtio16_to_cpu(vring->ring.used->idx))
@@ -116,14 +116,13 @@ struct virtio_rdma_buf_pool_entry* vring_get_one(
 
     __sync_synchronize();
 
-    last_uesd = vring->last_used_idx & (vring->ring.num - 1);
-    idx = virtio32_to_cpu(vring->ring.used->ring[last_uesd].id);
-
+    last_used = vring->last_used_idx & (vring->ring.num - 1);
+    idx = virtio32_to_cpu(vring->ring.used->ring[last_used].id);
     if (idx >= vring->ring.num) {
         printf("Bad vring used idx\n");
         return NULL;
     }
-    
+
     vring->last_used_idx++;
     return &vring->pool_table[idx];
 }

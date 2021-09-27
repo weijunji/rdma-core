@@ -82,7 +82,7 @@ inline struct virtio_rdma_buf_pool_entry* vring_flist_pop(
 
     entry = ring->free_head.next;
     ring->free_head.next = entry->next;
-    // printf("buf %p phys %llx\n", entry->buf, entry->desc->addr);
+    // printf("pop from %p phys %llx\n", ring, entry->);
     return entry;
 }
 

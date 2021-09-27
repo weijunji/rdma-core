@@ -168,7 +168,8 @@ static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
 {
 	struct virtio_rdma_cq *cq;
 	struct uvirtio_rdma_create_cq_resp resp;
-	int rc;
+	struct virtio_rdma_buf_pool_entry *buf_entry;
+	int rc, i;
 
 	cq = calloc(1, sizeof(*cq));
 	if (!cq)
@@ -203,7 +204,14 @@ static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
 		goto fail;
 	}
 
+	for (i = 0; i < 16; i++) {
+		buf_entry = vring_flist_pop(&cq->vring);
+		vring_add_one(&cq->vring, buf_entry, sizeof(struct virtio_rdma_cqe));
+	}
+
 	printf("debug cq %s\n", (char*)cq->vring.kbuf);
+	printf("num_cqe %u %u\n", cq->num_cqe, resp.num_cvqe);
+	cq->vring.last_used_idx = 512;
 
 	return &cq->ibv_cq.cq;
 
@@ -214,10 +222,40 @@ fail:
 	return NULL;
 }
 
-static int virtio_rdma_poll_cq (struct ibv_cq *cq, int num_entries,
+static int virtio_rdma_poll_cq (struct ibv_cq *ibcq, int num_entries,
 								struct ibv_wc *wc)
 {
-	return 0;
+	struct virtio_rdma_cq *cq = to_vcq(ibcq);
+	struct virtio_rdma_buf_pool_entry* buf_entry;
+	struct virtio_rdma_cqe *cqe;
+	int i = 0;
+
+	pthread_spin_lock(&cq->lock);
+	while (i < num_entries) {
+		buf_entry = vring_get_one(&cq->vring);
+		if (!buf_entry)
+			break;
+
+		cqe = buf_entry->buf;
+		wc[i].wr_id = cqe->wr_id;
+		wc[i].status = cqe->status;
+		wc[i].opcode = cqe->opcode;
+		wc[i].vendor_err = cqe->vendor_err;
+		wc[i].byte_len = cqe->byte_len;
+		// TODO: wc[i].qp_num
+		wc[i].imm_data = cqe->imm_data;
+		wc[i].src_qp = cqe->src_qp;
+		wc[i].slid = cqe->slid;
+		wc[i].wc_flags = cqe->wc_flags;
+		wc[i].pkey_index = cqe->pkey_index;
+		wc[i].sl = cqe->sl;
+		wc[i].dlid_path_bits = cqe->dlid_path_bits;
+
+		vring_add_one(&cq->vring, buf_entry, buf_entry->len);
+		i++;
+	}
+	pthread_spin_unlock(&cq->lock);
+	return i;
 }
 
 static int virtio_rdma_destroy_cq (struct ibv_cq *ibcq)
@@ -231,6 +269,7 @@ static int virtio_rdma_destroy_cq (struct ibv_cq *ibcq)
 
 	if (cq->vring.buf)
 		munmap(cq->vring.buf, cq->vring.buf_size);
+	free(cq->vring.pool_table);
 	free(cq);
 	return 0;
 }
@@ -306,16 +345,14 @@ static struct ibv_qp* virtio_rdma_create_qp (struct ibv_pd *pd,
 	// DEBUG
 	vring_notify(&qp->sq);
 	vring_notify(&qp->rq);
-	printf("debug sq %s\n", (char*)qp->sq.kbuf);
-	printf("debug rq %s\n", (char*)qp->rq.kbuf);
+	printf("debug sq %s %u %u\n", (char*)qp->sq.kbuf, qp->sq.index, qp->qpn);
+	printf("debug rq %s %u\n", (char*)qp->rq.kbuf, qp->rq.index);
 
 	return &qp->ibv_qp.qp;
 
 fail_rq:
-printf("fail 1111\n");
 	munmap(qp->rq.buf, qp->rq.buf_size);
 fail_sq:
-printf("fail 22222\n");
 	munmap(qp->sq.buf, qp->sq.buf_size);
 fail:
 	ibv_cmd_destroy_qp(&qp->ibv_qp.qp);
@@ -330,17 +367,22 @@ static struct ibv_qp* virtio_rdma_create_qp_ex (struct ibv_context *context,
 	return NULL;
 }
 
-static int virtio_rdma_query_qp (struct ibv_qp *qp, struct ibv_qp_attr *attr,
+static int virtio_rdma_query_qp (struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			              		 int attr_mask,
 								 struct ibv_qp_init_attr *init_attr)
 {
-	return 0;
+	struct ibv_query_qp cmd = {};
+
+	return ibv_cmd_query_qp(ibqp, attr, attr_mask, init_attr,
+				&cmd, sizeof(cmd));
 }
 
-static int virtio_rdma_modify_qp (struct ibv_qp *qp, struct ibv_qp_attr *attr,
+static int virtio_rdma_modify_qp (struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			               		  int attr_mask)
 {
-	return 0;
+	struct ibv_modify_qp cmd = {};
+
+	return ibv_cmd_modify_qp(ibqp, attr, attr_mask, &cmd, sizeof(cmd));
 }
 
 static int virtio_rdma_destroy_qp (struct ibv_qp *ibqp)
@@ -356,15 +398,95 @@ static int virtio_rdma_destroy_qp (struct ibv_qp *ibqp)
 		munmap(qp->sq.buf, qp->sq.buf_size);
 	if (qp->rq.buf)
 		munmap(qp->rq.buf, qp->rq.buf_size);
+	free(qp->sq.pool_table);
+	free(qp->rq.pool_table);
 	free(qp);
 	return 0;
 }
 
-static int	virtio_rdma_post_send (struct ibv_qp *qp, struct ibv_send_wr *wr,
+static int	virtio_rdma_post_send (struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			               		   struct ibv_send_wr **bad_wr)
 {
-	printf("post send\n");
-	return 0;
+	struct virtio_rdma_qp* qp = to_vqp(ibqp);
+	struct virtio_rdma_buf_pool_entry* buf_entry;
+	struct virtio_rdma_cmd_post_send *cmd;
+	struct virtio_rdma_sge *sgl;
+	uint32_t sgl_len;
+	int rc = 0;
+
+	pthread_spin_lock(&qp->slock);
+	while (wr) {
+		while ((buf_entry = vring_get_one(&qp->sq)) != NULL) {
+			//printf("Got one in sq\n");
+			vring_flist_push(&qp->sq, buf_entry);
+		}
+
+		// TODO: more check
+		buf_entry = vring_flist_pop(&qp->sq);
+		if (!buf_entry) {
+			rc = -ENOMEM;
+			printf("error\n");
+			goto out_err;
+		}
+
+		cmd = buf_entry->buf;
+		sgl = buf_entry->buf + sizeof(*cmd);
+		sgl_len = sizeof(*sgl) * wr->num_sge;
+
+		cmd->qpn = qp->qpn;
+		cmd->is_kernel = 0;
+		cmd->num_sge = wr->num_sge;
+		cmd->send_flags = wr->send_flags;
+		cmd->opcode = wr->opcode;
+		cmd->wr_id = wr->wr_id;
+		cmd->ex.imm_data = wr->imm_data;
+
+		switch (ibqp->qp_type) {
+		case IBV_QPT_UD:
+			printf("Not support UD now\n");
+			rc = -EINVAL;
+			goto out_err;
+			break;
+		case IBV_QPT_RC:
+			switch (wr->opcode) {
+			case IBV_WR_RDMA_READ:
+			case IBV_WR_RDMA_WRITE:
+			case IBV_WR_RDMA_WRITE_WITH_IMM:
+				cmd->wr.rdma.remote_addr = wr->wr.rdma.remote_addr;
+				cmd->wr.rdma.rkey = wr->wr.rdma.rkey;
+				break;
+			case IBV_WR_LOCAL_INV:
+			case IBV_WR_SEND_WITH_INV:
+				cmd->ex.invalidate_rkey = wr->invalidate_rkey;
+				break;
+			case IBV_WR_ATOMIC_CMP_AND_SWP:
+			case IBV_WR_ATOMIC_FETCH_AND_ADD:
+				cmd->wr.atomic.remote_addr = wr->wr.atomic.remote_addr;
+				cmd->wr.atomic.rkey = wr->wr.atomic.rkey;
+				cmd->wr.atomic.compare_add = wr->wr.atomic.compare_add;
+				if (wr->opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
+					cmd->wr.atomic.swap = wr->wr.atomic.swap;
+				break;
+			default:
+				break;
+			}
+			break;
+		default:
+			rc = -EINVAL;
+			goto out_err;
+		}
+		memcpy(sgl, wr->sg_list, sgl_len);
+
+		vring_add_one(&qp->sq, buf_entry, sizeof(*cmd) + sgl_len);
+
+		wr = wr->next;
+	}
+	vring_notify(&qp->sq);
+
+out_err:
+	*bad_wr = wr;
+	pthread_spin_unlock(&qp->slock);
+	return rc;
 }
 
 static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
@@ -377,7 +499,7 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	uint32_t sgl_len;
 	int rc = 0;
 
-	pthread_spin_lock(&qp->slock);
+	pthread_spin_lock(&qp->rlock);
 	while (wr) {
 		while ((buf_entry = vring_get_one(&qp->rq)) != NULL) {
 			vring_flist_push(&qp->rq, buf_entry);
@@ -410,7 +532,7 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	vring_notify(&qp->rq);
 
 out:
-	pthread_spin_unlock(&qp->slock);
+	pthread_spin_unlock(&qp->rlock);
 	return rc;
 }
 
@@ -423,6 +545,7 @@ static const struct verbs_context_ops virtio_rdma_ctx_ops = {
 	.dereg_mr = virtio_rdma_dereg_mr,
 	.create_cq = virtio_rdma_create_cq,
 	.poll_cq = virtio_rdma_poll_cq,
+	.req_notify_cq = ibv_cmd_req_notify_cq,
 	.destroy_cq = virtio_rdma_destroy_cq,
 	// .create_srq = virtio_rdma_create_srq,
 	// .modify_srq = virtio_rdma_modify_srq,
