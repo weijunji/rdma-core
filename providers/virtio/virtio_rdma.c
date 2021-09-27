@@ -42,10 +42,10 @@
 #include <pthread.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
-#include <sys/eventfd.h>
 #include <errno.h>
-
 #include <stddef.h>
+
+#include <linux/virtio_ring.h>
 
 #include <infiniband/driver.h>
 #include <infiniband/verbs.h>
@@ -185,17 +185,25 @@ static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 	cq->num_cqe = resp.num_cqe;
 
-	cq->queue_size = resp.num_cqe * sizeof(*cq->queue);
-
-	cq->queue = mmap(NULL, cq->queue_size, PROT_READ | PROT_WRITE,
+	cq->vring.buf = mmap(NULL, resp.cq_size, PROT_READ | PROT_WRITE,
 			 MAP_SHARED, ctx->cmd_fd, resp.offset);
-
-	printf("debug cq %s\n", (char*)cq->queue);
-
-	if (cq->queue == MAP_FAILED) {
+	if (cq->vring.buf == MAP_FAILED) {
 		printf("CQ mapping failed: %d", errno);
 		goto fail;
 	}
+
+	cq->vring.buf_size = resp.cq_size;
+	cq->vring.kbuf = cq->vring.buf + resp.vq_size;
+	cq->vring.kbuf_addr = resp.cq_phys_addr;
+	cq->vring.kbuf_len = resp.cq_size - resp.vq_size;
+
+	vring_init(&cq->vring.ring, resp.num_cvqe, cq->vring.buf, resp.vq_align);
+	if (vring_init_pool(&cq->vring, cq->num_cqe, sizeof(struct virtio_rdma_cqe), true)) {
+		munmap(cq->vring.buf, cq->vring.buf_size);
+		goto fail;
+	}
+
+	printf("debug cq %s\n", (char*)cq->vring.kbuf);
 
 	return &cq->ibv_cq.cq;
 
@@ -221,10 +229,9 @@ static int virtio_rdma_destroy_cq (struct ibv_cq *ibcq)
 	if (rc)
 		return rc;
 
-	if (cq->queue_size)
-		munmap(cq->queue, cq->queue_size);
+	if (cq->vring.buf)
+		munmap(cq->vring.buf, cq->vring.buf_size);
 	free(cq);
-
 	return 0;
 }
 
@@ -232,67 +239,84 @@ static struct ibv_qp* virtio_rdma_create_qp (struct ibv_pd *pd,
 									  		 struct ibv_qp_init_attr *attr)
 {
 	struct virtio_rdma_qp *qp;
-	struct uvirtio_rdma_create_qp cmd;
 	struct uvirtio_rdma_create_qp_resp resp;
 	int rc;
+	__u32 page_size;
 
 	qp = calloc(1, sizeof(*qp));
 	if (!qp)
 		return NULL;
-	
-	qp->send_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	qp->recv_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	cmd.send_eventfd = qp->send_efd;
-	cmd.recv_eventfd = qp->recv_efd;
 
 	rc = ibv_cmd_create_qp(pd, &qp->ibv_qp.qp, attr,
-			       &cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp, sizeof(resp));
+			       NULL, 0, &resp.ibv_resp, sizeof(resp));
 	if (rc) {
 		printf("qp creation failed: %d\n", rc);
 		free(qp);
 		return NULL;
 	}
 
-	qp->sq.addr = mmap(NULL, resp.sq_size, PROT_READ | PROT_WRITE,
+	page_size = resp.page_size;
+
+	pthread_spin_init(&qp->slock, PTHREAD_PROCESS_PRIVATE);
+	pthread_spin_init(&qp->rlock, PTHREAD_PROCESS_PRIVATE);
+	qp->num_sqe = resp.num_sqe;
+	qp->num_rqe = resp.num_rqe;
+	qp->num_sq_sge = attr->cap.max_send_sge;
+	qp->num_rq_sge = attr->cap.max_recv_sge;
+	qp->qpn = resp.qpn;
+
+	qp->sq.buf = mmap(NULL, resp.sq_size, PROT_READ | PROT_WRITE,
 			 MAP_SHARED, pd->context->cmd_fd, resp.sq_offset);
-	if (qp->sq.addr == MAP_FAILED) {
+	if (qp->sq.buf == MAP_FAILED) {
 		printf("QP mapping failed: %d\n", errno);
 		goto fail;
 	}
 
-	qp->sq.doorbell = qp->sq.addr;
+	qp->sq.doorbell = qp->sq.buf;
 	qp->sq.index = resp.sq_idx;
-	*(__u16*)qp->sq.doorbell = htole16(qp->sq.index);
+	qp->sq.buf_size = resp.sq_size;
+	qp->sq.kbuf = qp->sq.buf + page_size + resp.svq_size;
+	qp->sq.kbuf_addr = resp.sq_phys_addr;
+	qp->sq.kbuf_len = resp.sq_size - page_size - resp.svq_size;
+	vring_init(&qp->sq.ring, resp.num_svqe, qp->sq.buf + page_size, resp.vq_align);
+	if (vring_init_pool(&qp->sq, qp->num_sqe,
+		sizeof(struct virtio_rdma_cmd_post_send) + qp->num_sq_sge *
+		sizeof(struct virtio_rdma_sge), false))
+		goto fail_sq;
 
-	qp->rq.addr = mmap(NULL, resp.rq_size, PROT_READ | PROT_WRITE,
+	qp->rq.buf = mmap(NULL, resp.rq_size, PROT_READ | PROT_WRITE,
 			 MAP_SHARED, pd->context->cmd_fd, resp.rq_offset);
-	if (qp->rq.addr == MAP_FAILED) {
+	if (qp->rq.buf == MAP_FAILED) {
 		printf("QP mapping failed: %d\n", errno);
-		goto fail;
+		goto fail_sq;
 	}
 
-	qp->rq.doorbell = qp->rq.addr;
+	qp->rq.doorbell = qp->rq.buf;
 	qp->rq.index = resp.rq_idx;
-	*(__u16*)qp->rq.doorbell = htole16(qp->rq.index);
-/*	
-	int getpagesize(void);
-	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
-	cq->num_cqe = resp.num_cqe;
+	qp->rq.buf_size = resp.rq_size;
+	qp->rq.kbuf = qp->rq.buf + page_size + resp.rvq_size;
+	qp->rq.kbuf_addr = resp.rq_phys_addr;
+	qp->rq.kbuf_len = resp.rq_size - page_size - resp.rvq_size;
+	vring_init(&qp->rq.ring, resp.num_rvqe, qp->rq.buf + page_size, resp.vq_align);
+	if (vring_init_pool(&qp->rq, qp->num_rqe,
+		sizeof(struct virtio_rdma_cmd_post_recv) + qp->num_rq_sge *
+		sizeof(struct virtio_rdma_sge), false))
+		goto fail_rq;
 
-	cq->queue_size = resp.num_cqe * sizeof(*cq->queue);
+	// DEBUG
+	vring_notify(&qp->sq);
+	vring_notify(&qp->rq);
+	printf("debug sq %s\n", (char*)qp->sq.kbuf);
+	printf("debug rq %s\n", (char*)qp->rq.kbuf);
 
-	cq->queue = mmap(NULL, cq->queue_size, PROT_READ | PROT_WRITE,
-			 MAP_SHARED, ctx->cmd_fd, resp.offset);
-
-	printf("debug cq %s\n", (char*)cq->queue);
-
-	if (cq->queue == MAP_FAILED) {
-		printf("CQ mapping failed: %d", errno);
-		goto fail;
-	}
-*/
 	return &qp->ibv_qp.qp;
 
+fail_rq:
+printf("fail 1111\n");
+	munmap(qp->rq.buf, qp->rq.buf_size);
+fail_sq:
+printf("fail 22222\n");
+	munmap(qp->sq.buf, qp->sq.buf_size);
 fail:
 	ibv_cmd_destroy_qp(&qp->ibv_qp.qp);
 	free(qp);
@@ -319,21 +343,75 @@ static int virtio_rdma_modify_qp (struct ibv_qp *qp, struct ibv_qp_attr *attr,
 	return 0;
 }
 
-static int virtio_rdma_destroy_qp (struct ibv_qp *qp)
+static int virtio_rdma_destroy_qp (struct ibv_qp *ibqp)
 {
+	struct virtio_rdma_qp *qp = to_vqp(ibqp);
+	int rc;
+
+	rc = ibv_cmd_destroy_qp(ibqp);
+	if (rc)
+		return rc;
+
+	if (qp->sq.buf)
+		munmap(qp->sq.buf, qp->sq.buf_size);
+	if (qp->rq.buf)
+		munmap(qp->rq.buf, qp->rq.buf_size);
+	free(qp);
 	return 0;
 }
 
 static int	virtio_rdma_post_send (struct ibv_qp *qp, struct ibv_send_wr *wr,
 			               		   struct ibv_send_wr **bad_wr)
 {
+	printf("post send\n");
 	return 0;
 }
 
-static int	virtio_rdma_post_recv (struct ibv_qp *qp, struct ibv_recv_wr *wr,
+static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			 			   		   struct ibv_recv_wr **bad_wr)
 {
-	return 0;
+	struct virtio_rdma_qp* qp = to_vqp(ibqp);
+	struct virtio_rdma_buf_pool_entry* buf_entry;
+	struct virtio_rdma_cmd_post_recv *cmd;
+	struct virtio_rdma_sge *sgl;
+	uint32_t sgl_len;
+	int rc = 0;
+
+	pthread_spin_lock(&qp->slock);
+	while (wr) {
+		while ((buf_entry = vring_get_one(&qp->rq)) != NULL) {
+			vring_flist_push(&qp->rq, buf_entry);
+		}
+
+		// TODO: more check
+		buf_entry = vring_flist_pop(&qp->rq);
+		if (!buf_entry) {
+			*bad_wr = wr;
+			rc = -ENOMEM;
+			printf("error\n");
+			goto out;
+		}
+
+		cmd = buf_entry->buf;
+		sgl = buf_entry->buf + sizeof(*cmd);
+		sgl_len = sizeof(*sgl) * wr->num_sge;
+
+		cmd->qpn = qp->qpn;
+		cmd->is_kernel = 0;
+		cmd->num_sge = wr->num_sge;
+		cmd->wr_id = wr->wr_id;
+		memcpy(sgl, wr->sg_list, sgl_len);
+
+		vring_add_one(&qp->rq, buf_entry, sizeof(*cmd) + sgl_len);
+
+		wr = wr->next;
+	}
+// FIXME: notify suppression
+	vring_notify(&qp->rq);
+
+out:
+	pthread_spin_unlock(&qp->slock);
+	return rc;
 }
 
 static const struct verbs_context_ops virtio_rdma_ctx_ops = {

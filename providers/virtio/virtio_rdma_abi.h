@@ -42,5 +42,5 @@
 DECLARE_DRV_CMD(uvirtio_rdma_create_cq, IB_USER_VERBS_CMD_CREATE_CQ,
 		empty, virtio_rdma_create_cq_uresp);
 DECLARE_DRV_CMD(uvirtio_rdma_create_qp, IB_USER_VERBS_CMD_CREATE_QP,
-		virtio_rdma_create_qp_ureq, virtio_rdma_create_qp_uresp);
+		empty, virtio_rdma_create_qp_uresp);
 #endif

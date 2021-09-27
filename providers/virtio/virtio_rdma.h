@@ -56,30 +56,25 @@ struct virtio_rdma_cq {
     struct verbs_cq		ibv_cq;
 
     pthread_spinlock_t	lock;
-    struct virtio_rdma_cqe *queue;
+    struct virtio_rdma_vring vring;
 
-    uint32_t cqe_get;
     uint32_t num_cqe;
-    size_t queue_size;
-};
-
-struct virtio_rdma_vring {
-    struct vring ring;
-    int index;
-
-    void* addr;
-    void* buf;
-    void* doorbell;
 };
 
 struct virtio_rdma_qp {
     struct verbs_qp		ibv_qp;
 
-    int send_efd;
-    int recv_efd;
-
+    pthread_spinlock_t	slock;
+    pthread_spinlock_t	rlock;
     struct virtio_rdma_vring sq;
     struct virtio_rdma_vring rq;
+
+    uint32_t num_sqe;
+    uint32_t num_rqe;
+    uint32_t num_sq_sge;
+    uint32_t num_rq_sge;
+
+    uint32_t qpn;
 };
 
 inline struct virtio_rdma_device* to_vdev(struct ibv_device* ibv_dev) {
@@ -92,6 +87,10 @@ inline struct virtio_rdma_context* to_vctx(struct ibv_context* ibv_ctx) {
 
 inline struct virtio_rdma_cq* to_vcq(struct ibv_cq* ibv_cq) {
     return container_of(ibv_cq, struct virtio_rdma_cq, ibv_cq.cq);
+}
+
+inline struct virtio_rdma_qp* to_vqp(struct ibv_qp* ibv_qp) {
+    return container_of(ibv_qp, struct virtio_rdma_qp, ibv_qp.qp);
 }
 
 #endif

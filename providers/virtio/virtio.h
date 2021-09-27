@@ -35,4 +35,70 @@
 #ifndef __VIRTIO_H__
 #define __VIRTIO_H__
 
+#include <stdbool.h>
+#include <endian.h>
+
+#include <linux/virtio_ring.h>
+
+struct virtio_rdma_buf_pool_entry {
+    struct virtio_rdma_buf_pool_entry *next;
+
+    struct vring_desc* desc;
+    void* buf;
+    __u32 len;
+
+    __u16 index; // index in pool_table
+};
+
+struct virtio_rdma_vring {
+    struct vring ring;
+    uint16_t index;
+    volatile void* doorbell;
+    uint16_t next_avail;
+    uint16_t last_used_idx;
+
+    void* buf; // mmap's buf
+    __u64 buf_size; // mmap's total size
+
+    void* kbuf; // physical buffer
+    __u64 kbuf_addr; // physical address of kbuf
+    __u64 kbuf_len; // physical buffer length
+
+    struct virtio_rdma_buf_pool_entry *pool_table;
+    struct virtio_rdma_buf_pool_entry free_head; // dummy head of free list
+};
+
+inline void vring_flist_push(struct virtio_rdma_vring* ring,
+                            struct virtio_rdma_buf_pool_entry* entry) {
+    entry->next = ring->free_head.next;
+    ring->free_head.next = entry;
+}
+
+inline struct virtio_rdma_buf_pool_entry* vring_flist_pop(
+    struct virtio_rdma_vring* ring) {
+    struct virtio_rdma_buf_pool_entry* entry;
+    if (ring->free_head.next == NULL)
+        return NULL;
+
+    entry = ring->free_head.next;
+    ring->free_head.next = entry->next;
+    // printf("buf %p phys %llx\n", entry->buf, entry->desc->addr);
+    return entry;
+}
+
+#define cpu_to_virtio16 htole16
+#define cpu_to_virtio32 htole32
+#define cpu_to_virtio64 htole64
+
+#define virtio16_to_cpu le16toh
+#define virtio32_to_cpu le32toh
+#define virtio64_to_cpu le64toh
+
+void vring_notify(struct virtio_rdma_vring *vring);
+int vring_init_pool(struct virtio_rdma_vring *vring, __u32 num, __u32 len,
+                    bool device_writable);
+void vring_add_one(struct virtio_rdma_vring *vring,
+                   struct virtio_rdma_buf_pool_entry* entry, __u32 len);
+struct virtio_rdma_buf_pool_entry* vring_get_one(
+        struct virtio_rdma_vring *vring);
 #endif
