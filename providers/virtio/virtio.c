@@ -54,7 +54,11 @@ static inline void writew(uint16_t val, volatile void *addr)
 }
 
 void vring_notify(struct virtio_rdma_vring *vring) {
-    writew(vring->index, vring->doorbell);
+    bool needs_kick;
+    needs_kick = !(vring->ring.used->flags &
+					cpu_to_virtio16(VRING_USED_F_NO_NOTIFY));
+    if (needs_kick)
+        writew(virtio16_to_cpu(vring->index), vring->doorbell);
 }
 
 int vring_init_pool(struct virtio_rdma_vring *vring, __u32 num, __u32 len,
