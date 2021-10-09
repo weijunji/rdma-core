@@ -99,20 +99,22 @@ static int virtio_rdma_query_port(struct ibv_context *context, uint8_t port,
 static struct ibv_pd *virtio_rdma_alloc_pd(struct ibv_context *context)
 {
 	struct ibv_alloc_pd cmd;
-	struct ib_uverbs_alloc_pd_resp resp;
-	struct ibv_pd *pd;
+	struct uvirtio_rdma_alloc_pd_resp resp;
+	struct virtio_rdma_pd *pd;
 
 	pd = malloc(sizeof(*pd));
 	if (!pd)
 		return NULL;
 
-	if (ibv_cmd_alloc_pd(context, pd, &cmd, sizeof(cmd),
-					&resp, sizeof(resp))) {
+	if (ibv_cmd_alloc_pd(context, &pd->ibv_pd, &cmd, sizeof(cmd),
+					&resp.ibv_resp, sizeof(resp))) {
 		free(pd);
 		return NULL;
 	}
 
-	return pd;
+	pd->pdn = resp.pdn;
+printf("DEBUG pdn %u", pd->pdn);
+	return &pd->ibv_pd;
 }
 
 static int virtio_rdma_dealloc_pd(struct ibv_pd *pd)
@@ -204,14 +206,15 @@ static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
 		goto fail;
 	}
 
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < cq->num_cqe; i++) {
 		buf_entry = vring_flist_pop(&cq->vring);
 		vring_add_one(&cq->vring, buf_entry, sizeof(struct virtio_rdma_cqe));
 	}
 
 	printf("debug cq %s\n", (char*)cq->vring.kbuf);
 	printf("num_cqe %u %u\n", cq->num_cqe, resp.num_cvqe);
-	cq->vring.last_used_idx = 512;
+	// FIXME: need reset virtqueue
+	// cq->vring.last_used_idx = 512;
 
 	return &cq->ibv_cq.cq;
 
@@ -243,14 +246,14 @@ static int virtio_rdma_poll_cq (struct ibv_cq *ibcq, int num_entries,
 		wc[i].vendor_err = cqe->vendor_err;
 		wc[i].byte_len = cqe->byte_len;
 		// TODO: wc[i].qp_num
-		wc[i].imm_data = cqe->imm_data;
+		wc[i].imm_data = cqe->ex.imm_data;
 		wc[i].src_qp = cqe->src_qp;
 		wc[i].slid = cqe->slid;
 		wc[i].wc_flags = cqe->wc_flags;
 		wc[i].pkey_index = cqe->pkey_index;
 		wc[i].sl = cqe->sl;
 		wc[i].dlid_path_bits = cqe->dlid_path_bits;
-
+		// printf("got cqe %lu\n", wc[i].wr_id);
 		vring_add_one(&cq->vring, buf_entry, buf_entry->len);
 		i++;
 	}
@@ -285,7 +288,7 @@ static struct ibv_qp* virtio_rdma_create_qp (struct ibv_pd *pd,
 	qp = calloc(1, sizeof(*qp));
 	if (!qp)
 		return NULL;
-
+printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 	rc = ibv_cmd_create_qp(pd, &qp->ibv_qp.qp, attr,
 			       NULL, 0, &resp.ibv_resp, sizeof(resp));
 	if (rc) {
@@ -361,12 +364,6 @@ fail:
 	return NULL;
 }
 
-static struct ibv_qp* virtio_rdma_create_qp_ex (struct ibv_context *context,
-			struct ibv_qp_init_attr_ex *qp_init_attr_ex)
-{
-	return NULL;
-}
-
 static int virtio_rdma_query_qp (struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			              		 int attr_mask,
 								 struct ibv_qp_init_attr *init_attr)
@@ -413,7 +410,7 @@ static int	virtio_rdma_post_send (struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	struct virtio_rdma_sge *sgl;
 	uint32_t sgl_len;
 	int rc = 0;
-
+	//printf("post_send\n");
 	pthread_spin_lock(&qp->slock);
 	while (wr) {
 		while ((buf_entry = vring_get_one(&qp->sq)) != NULL) {
@@ -443,9 +440,9 @@ static int	virtio_rdma_post_send (struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		switch (ibqp->qp_type) {
 		case IBV_QPT_UD:
-			printf("Not support UD now\n");
-			rc = -EINVAL;
-			goto out_err;
+			cmd->wr.ud.remote_qpn = wr->wr.ud.remote_qpn;
+			cmd->wr.ud.remote_qkey = wr->wr.ud.remote_qkey;
+			cmd->wr.ud.av = to_vah(wr->wr.ud.ah)->av;
 			break;
 		case IBV_QPT_RC:
 			switch (wr->opcode) {
@@ -498,7 +495,7 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	struct virtio_rdma_sge *sgl;
 	uint32_t sgl_len;
 	int rc = 0;
-
+	// printf("post_recv\n");
 	pthread_spin_lock(&qp->rlock);
 	while (wr) {
 		while ((buf_entry = vring_get_one(&qp->rq)) != NULL) {
@@ -528,12 +525,105 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 
 		wr = wr->next;
 	}
-// FIXME: notify suppression
 	vring_notify(&qp->rq);
 
 out:
 	pthread_spin_unlock(&qp->rlock);
 	return rc;
+}
+
+static int is_multicast_gid(const union ibv_gid *gid)
+{
+	return gid->raw[0] == 0xff;
+}
+
+static int is_link_local_gid(const union ibv_gid *gid)
+{
+	return gid->global.subnet_prefix == htobe64(0xfe80000000000000ULL);
+}
+
+static int is_ipv6_addr_v4mapped(const struct in6_addr *a)
+{
+	return IN6_IS_ADDR_V4MAPPED(&a->s6_addr32) ||
+		/* IPv4 encoded multicast addresses */
+		(a->s6_addr32[0] == htobe32(0xff0e0000) &&
+		((a->s6_addr32[1] |
+		 (a->s6_addr32[2] ^ htobe32(0x0000ffff))) == 0UL));
+}
+
+static int set_mac_from_gid(const union ibv_gid *gid,
+			     __u8 mac[6])
+{
+	if (is_link_local_gid(gid)) {
+		/*
+		 * The MAC is embedded in GID[8-10,13-15] with the
+		 * 7th most significant bit inverted.
+		 */
+		memcpy(mac, gid->raw + 8, 3);
+		memcpy(mac + 3, gid->raw + 13, 3);
+		mac[0] ^= 2;
+
+		return 0;
+	}
+
+	return 1;
+}
+
+static struct ibv_ah* virtio_rdma_create_ah(struct ibv_pd *pd,
+				struct ibv_ah_attr *attr)
+{
+	struct virtio_rdma_ah *ah;
+	struct virtio_rdma_av *av;
+	struct ibv_port_attr port_attr;
+
+	if (!attr->is_global)
+		return NULL;
+
+	if (ibv_query_port(pd->context, attr->port_num, &port_attr))
+		return NULL;
+
+	if (port_attr.link_layer == IBV_LINK_LAYER_UNSPECIFIED ||
+	    port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND)
+		return NULL;
+
+	if (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET &&
+	    (!is_link_local_gid(&attr->grh.dgid) &&
+	     !is_multicast_gid(&attr->grh.dgid)  &&
+	     !is_ipv6_addr_v4mapped((struct in6_addr *)attr->grh.dgid.raw)))
+		return NULL;
+
+	ah = calloc(1, sizeof(*ah));
+	if (!ah)
+		return NULL;
+
+	av = &ah->av;
+	av->port = attr->port_num;
+	av->pdn = to_vpd(pd)->pdn;
+	av->src_path_bits = attr->src_path_bits;
+	av->src_path_bits |= 0x80;
+	av->gid_index = attr->grh.sgid_index;
+	av->hop_limit = attr->grh.hop_limit;
+	av->sl_tclass_flowlabel = (attr->grh.traffic_class << 20) |
+				   attr->grh.flow_label;
+	memcpy(av->dgid, attr->grh.dgid.raw, 16);
+
+	if (port_attr.port_cap_flags & IBV_PORT_IP_BASED_GIDS) {
+		if (!ibv_resolve_eth_l2_from_gid(pd->context, attr,
+						 av->dmac, NULL))
+			return &ah->ibv_ah;
+	} else {
+		if (!set_mac_from_gid(&attr->grh.dgid, av->dmac))
+			return &ah->ibv_ah;
+	}
+
+	free(ah);
+	return NULL;
+}
+
+static int virtio_rdma_destroy_ah(struct ibv_ah *ah)
+{
+	free(to_vah(ah));
+	return 0;
 }
 
 static const struct verbs_context_ops virtio_rdma_ctx_ops = {
@@ -543,24 +633,27 @@ static const struct verbs_context_ops virtio_rdma_ctx_ops = {
 	.dealloc_pd = virtio_rdma_dealloc_pd,
 	.reg_mr = virtio_rdma_reg_mr,
 	.dereg_mr = virtio_rdma_dereg_mr,
+
 	.create_cq = virtio_rdma_create_cq,
 	.poll_cq = virtio_rdma_poll_cq,
 	.req_notify_cq = ibv_cmd_req_notify_cq,
 	.destroy_cq = virtio_rdma_destroy_cq,
+
 	// .create_srq = virtio_rdma_create_srq,
 	// .modify_srq = virtio_rdma_modify_srq,
 	// .query_srq = virtio_rdma_query_srq,
 	// .destroy_srq = virtio_rdma_destroy_srq,
 	// .post_srq_recv = virtio_rdma_post_srq_recv,
+
 	.create_qp = virtio_rdma_create_qp,
-	.create_qp_ex = virtio_rdma_create_qp_ex,
 	.query_qp = virtio_rdma_query_qp,
 	.modify_qp = virtio_rdma_modify_qp,
 	.destroy_qp = virtio_rdma_destroy_qp,
+
 	.post_send = virtio_rdma_post_send,
 	.post_recv = virtio_rdma_post_recv,
-	// .create_ah = virtio_rdma_create_ah,
-	// .destroy_ah = virtio_rdma_destroy_ah,
+	.create_ah = virtio_rdma_create_ah,
+	.destroy_ah = virtio_rdma_destroy_ah,
 	// .attach_mcast = ibv_cmd_attach_mcast,
 	// .detach_mcast = ibv_cmd_detach_mcast,
 	.free_context = virtio_rdma_free_context,

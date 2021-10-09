@@ -40,6 +40,10 @@
 
 #define VIRTIO_RDMA_ABI_VERSION 1
 
+struct virtio_rdma_alloc_pd_uresp {
+    __u32 pdn;
+};
+
 struct virtio_rdma_create_qp_uresp {
     __u64 sq_offset;
     __u64 sq_size;
@@ -79,7 +83,10 @@ struct virtio_rdma_cqe {
 	__u32 opcode;
 	__u32 vendor_err;
 	__u32 byte_len;
-	__u32 imm_data;
+	union {
+		__u32 imm_data;
+		__u32 invalidate_rkey;
+	}ex;
 	__u32 qp_num;
 	__u32 src_qp;
 	int	 wc_flags;
@@ -87,12 +94,26 @@ struct virtio_rdma_cqe {
 	__u16 slid;
 	__u8 sl;
 	__u8 dlid_path_bits;
+    __u8 port_num;
 };
 
 enum {
 	VIRTIO_RDMA_NOTIFY_NOT = (0),
 	VIRTIO_RDMA_NOTIFY_SOLICITED = (1 << 0),
 	VIRTIO_RDMA_NOTIFY_NEXT_COMPLETION = (1 << 1)
+};
+
+struct virtio_rdma_av {
+	__u32 port;
+    __u32 pdn;
+	__u32 sl_tclass_flowlabel;
+	__u8 dgid[16];
+	__u8 src_path_bits;
+	__u8 gid_index;
+	__u8 stat_rate;
+	__u8 hop_limit;
+	__u8 dmac[6];
+	__u8 reserved[6];
 };
 
 struct virtio_rdma_sge {
@@ -129,7 +150,7 @@ struct virtio_rdma_cmd_post_send {
         struct {
             __u32 remote_qpn;
             __u32 remote_qkey;
-            __u32 ahn;
+            struct virtio_rdma_av av;
         } ud;
         struct {
             __u32 mrn;

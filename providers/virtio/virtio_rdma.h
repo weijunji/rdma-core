@@ -52,6 +52,11 @@ struct virtio_rdma_context {
 	struct verbs_context	ibv_ctx;
 };
 
+struct virtio_rdma_pd {
+    struct ibv_pd ibv_pd;
+    __u32 pdn;
+};
+
 struct virtio_rdma_cq {
     struct verbs_cq		ibv_cq;
 
@@ -77,6 +82,11 @@ struct virtio_rdma_qp {
     uint32_t qpn;
 };
 
+struct virtio_rdma_ah {
+    struct ibv_ah	ibv_ah;
+    struct virtio_rdma_av av;
+};
+
 inline struct virtio_rdma_device* to_vdev(struct ibv_device* ibv_dev) {
     return container_of(ibv_dev, struct virtio_rdma_device, ibv_dev.device);
 }
@@ -85,12 +95,20 @@ inline struct virtio_rdma_context* to_vctx(struct ibv_context* ibv_ctx) {
     return container_of(ibv_ctx, struct virtio_rdma_context, ibv_ctx.context);
 }
 
+inline struct virtio_rdma_pd* to_vpd(struct ibv_pd* ibv_pd) {
+    return container_of(ibv_pd, struct virtio_rdma_pd, ibv_pd);
+}
+
 inline struct virtio_rdma_cq* to_vcq(struct ibv_cq* ibv_cq) {
     return container_of(ibv_cq, struct virtio_rdma_cq, ibv_cq.cq);
 }
 
 inline struct virtio_rdma_qp* to_vqp(struct ibv_qp* ibv_qp) {
     return container_of(ibv_qp, struct virtio_rdma_qp, ibv_qp.qp);
+}
+
+inline struct virtio_rdma_ah* to_vah(struct ibv_ah* ibv_ah) {
+    return container_of(ibv_ah, struct virtio_rdma_ah, ibv_ah);
 }
 
 #endif

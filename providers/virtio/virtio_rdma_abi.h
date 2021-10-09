@@ -39,6 +39,8 @@
 #include <rdma/virtio_rdma_abi.h>
 #include <kernel-abi/virtio_rdma_abi.h>
 
+DECLARE_DRV_CMD(uvirtio_rdma_alloc_pd, IB_USER_VERBS_CMD_ALLOC_PD,
+		empty, virtio_rdma_alloc_pd_uresp);
 DECLARE_DRV_CMD(uvirtio_rdma_create_cq, IB_USER_VERBS_CMD_CREATE_CQ,
 		empty, virtio_rdma_create_cq_uresp);
 DECLARE_DRV_CMD(uvirtio_rdma_create_qp, IB_USER_VERBS_CMD_CREATE_QP,

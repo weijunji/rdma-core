@@ -68,13 +68,13 @@ struct virtio_rdma_vring {
     struct virtio_rdma_buf_pool_entry free_head; // dummy head of free list
 };
 
-inline void vring_flist_push(struct virtio_rdma_vring* ring,
+static inline void vring_flist_push(struct virtio_rdma_vring* ring,
                             struct virtio_rdma_buf_pool_entry* entry) {
     entry->next = ring->free_head.next;
     ring->free_head.next = entry;
 }
 
-inline struct virtio_rdma_buf_pool_entry* vring_flist_pop(
+static inline struct virtio_rdma_buf_pool_entry* vring_flist_pop(
     struct virtio_rdma_vring* ring) {
     struct virtio_rdma_buf_pool_entry* entry;
     if (ring->free_head.next == NULL)
