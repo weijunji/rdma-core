@@ -101,4 +101,13 @@ void vring_add_one(struct virtio_rdma_vring *vring,
                    struct virtio_rdma_buf_pool_entry* entry, __u32 len);
 struct virtio_rdma_buf_pool_entry* vring_get_one(
         struct virtio_rdma_vring *vring);
+
+static __inline__ void vring_init_by_off(struct vring *vr, unsigned int num,
+            void *p, uint64_t used_off)
+{
+	vr->num = num;
+	vr->desc = p;
+	vr->avail = p + num * sizeof(struct vring_desc);
+	vr->used = p + used_off;
+}
 #endif

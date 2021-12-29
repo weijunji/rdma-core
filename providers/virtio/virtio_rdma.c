@@ -200,7 +200,7 @@ static struct ibv_cq* virtio_rdma_create_cq (struct ibv_context *ctx,
 	cq->vring.kbuf_addr = resp.cq_phys_addr;
 	cq->vring.kbuf_len = resp.cq_size - resp.vq_size;
 
-	vring_init(&cq->vring.ring, resp.num_cvqe, cq->vring.buf, resp.vq_align);
+	vring_init_by_off(&cq->vring.ring, resp.num_cvqe, cq->vring.buf, resp.used_off);
 	if (vring_init_pool(&cq->vring, cq->num_cqe, sizeof(struct virtio_rdma_cqe), true)) {
 		munmap(cq->vring.buf, cq->vring.buf_size);
 		goto fail;
@@ -320,7 +320,7 @@ printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 	qp->sq.kbuf = qp->sq.buf + page_size + resp.svq_size;
 	qp->sq.kbuf_addr = resp.sq_phys_addr;
 	qp->sq.kbuf_len = resp.sq_size - page_size - resp.svq_size;
-	vring_init(&qp->sq.ring, resp.num_svqe, qp->sq.buf + page_size, resp.vq_align);
+	vring_init_by_off(&qp->sq.ring, resp.num_svqe, qp->sq.buf + page_size, resp.svq_used_off);
 	if (vring_init_pool(&qp->sq, qp->num_sqe,
 		sizeof(struct virtio_rdma_cmd_post_send) + qp->num_sq_sge *
 		sizeof(struct virtio_rdma_sge), false))
@@ -339,7 +339,7 @@ printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 	qp->rq.kbuf = qp->rq.buf + page_size + resp.rvq_size;
 	qp->rq.kbuf_addr = resp.rq_phys_addr;
 	qp->rq.kbuf_len = resp.rq_size - page_size - resp.rvq_size;
-	vring_init(&qp->rq.ring, resp.num_rvqe, qp->rq.buf + page_size, resp.vq_align);
+	vring_init_by_off(&qp->rq.ring, resp.num_rvqe, qp->rq.buf + page_size, resp.rvq_used_off);
 	if (vring_init_pool(&qp->rq, qp->num_rqe,
 		sizeof(struct virtio_rdma_cmd_post_recv) + qp->num_rq_sge *
 		sizeof(struct virtio_rdma_sge), false))

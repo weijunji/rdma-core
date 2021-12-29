@@ -48,6 +48,7 @@ struct virtio_rdma_create_qp_uresp {
     __u64 sq_offset;
     __u64 sq_size;
     __u64 sq_phys_addr;
+    __u64 svq_used_off;
     __u32 svq_size;
     int num_sqe;
     int num_svqe;
@@ -56,12 +57,12 @@ struct virtio_rdma_create_qp_uresp {
     __u64 rq_offset;
     __u64 rq_size;
     __u64 rq_phys_addr;
+    __u64 rvq_used_off;
     __u32 rvq_size;
     int num_rqe;
     int num_rvqe;
     int rq_idx;
 
-    __u32 vq_align;
     __u32 page_size;
 
     __u32 qpn;
@@ -71,7 +72,7 @@ struct virtio_rdma_create_cq_uresp {
     __u64 offset;
     __u64 cq_size;
     __u64 cq_phys_addr;
-    __u32 vq_align;
+    __u64 used_off;
     __u32 vq_size;
     int num_cqe;
     int num_cvqe;
