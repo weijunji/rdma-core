@@ -109,7 +109,6 @@ struct virtio_rdma_av {
     __u32 pdn;
 	__u32 sl_tclass_flowlabel;
 	__u8 dgid[16];
-	__u8 src_path_bits;
 	__u8 gid_index;
 	__u8 stat_rate;
 	__u8 hop_limit;
@@ -124,8 +123,6 @@ struct virtio_rdma_sge {
 };
 
 struct virtio_rdma_cmd_post_send {
-    __u32 qpn;
-    __u32 is_kernel;
     __u32 num_sge;
 
     int send_flags;
@@ -162,9 +159,6 @@ struct virtio_rdma_cmd_post_send {
 };
 
 struct virtio_rdma_cmd_post_recv {
-	__u32 qpn;
-	__u32 is_kernel;
-
 	__u32 num_sge;
 	__u64 wr_id;
 };

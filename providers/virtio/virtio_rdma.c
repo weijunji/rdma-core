@@ -458,8 +458,6 @@ static int	virtio_rdma_post_send (struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		sgl = buf_entry->buf + sizeof(*cmd);
 		sgl_len = sizeof(*sgl) * wr->num_sge;
 
-		cmd->qpn = qp->qpn;
-		cmd->is_kernel = 0;
 		cmd->num_sge = wr->num_sge;
 		cmd->send_flags = wr->send_flags;
 		cmd->opcode = wr->opcode;
@@ -546,8 +544,6 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		sgl = buf_entry->buf + sizeof(*cmd);
 		sgl_len = sizeof(*sgl) * wr->num_sge;
 
-		cmd->qpn = qp->qpn;
-		cmd->is_kernel = 0;
 		cmd->num_sge = wr->num_sge;
 		cmd->wr_id = wr->wr_id;
 		memcpy(sgl, wr->sg_list, sgl_len);
@@ -633,8 +629,6 @@ static struct ibv_ah* virtio_rdma_create_ah(struct ibv_pd *pd,
 	av = &ah->av;
 	av->port = attr->port_num;
 	av->pdn = to_vpd(pd)->pdn;
-	av->src_path_bits = attr->src_path_bits;
-	av->src_path_bits |= 0x80;
 	av->gid_index = attr->grh.sgid_index;
 	av->hop_limit = attr->grh.hop_limit;
 	av->sl_tclass_flowlabel = (attr->grh.traffic_class << 20) |
