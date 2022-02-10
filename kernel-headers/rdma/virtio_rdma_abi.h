@@ -63,7 +63,7 @@ struct virtio_rdma_create_qp_uresp {
     int num_rvqe;
     int rq_idx;
 
-    __u32 page_size;
+    __u32 notifier_size;
 
     __u32 qpn;
 };

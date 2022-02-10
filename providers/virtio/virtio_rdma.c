@@ -283,7 +283,7 @@ static struct ibv_qp* virtio_rdma_create_qp (struct ibv_pd *pd,
 	struct virtio_rdma_qp *qp;
 	struct uvirtio_rdma_create_qp_resp resp;
 	int rc;
-	__u32 page_size;
+	__u32 notifier_size;
 
 	qp = calloc(1, sizeof(*qp));
 	if (!qp)
@@ -297,7 +297,7 @@ printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 		return NULL;
 	}
 
-	page_size = resp.page_size;
+	notifier_size = resp.notifier_size;
 
 	pthread_spin_init(&qp->slock, PTHREAD_PROCESS_PRIVATE);
 	pthread_spin_init(&qp->rlock, PTHREAD_PROCESS_PRIVATE);
@@ -314,13 +314,16 @@ printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 		goto fail;
 	}
 
-	qp->sq.doorbell = qp->sq.buf;
+	if (notifier_size)
+		qp->sq.doorbell = qp->sq.buf + resp.sq_size - notifier_size;
+	else
+		qp->sq.doorbell = NULL;
 	qp->sq.index = resp.sq_idx;
 	qp->sq.buf_size = resp.sq_size;
-	qp->sq.kbuf = qp->sq.buf + page_size + resp.svq_size;
+	qp->sq.kbuf = qp->sq.buf + resp.svq_size;
 	qp->sq.kbuf_addr = resp.sq_phys_addr;
-	qp->sq.kbuf_len = resp.sq_size - page_size - resp.svq_size;
-	vring_init_by_off(&qp->sq.ring, resp.num_svqe, qp->sq.buf + page_size, resp.svq_used_off);
+	qp->sq.kbuf_len = resp.sq_size - notifier_size - resp.svq_size;
+	vring_init_by_off(&qp->sq.ring, resp.num_svqe, qp->sq.buf, resp.svq_used_off);
 	if (vring_init_pool(&qp->sq, qp->num_sqe,
 		sizeof(struct virtio_rdma_cmd_post_send) + qp->num_sq_sge *
 		sizeof(struct virtio_rdma_sge), false))
@@ -333,21 +336,24 @@ printf("qp size: %d %d\n", attr->cap.max_send_wr, attr->cap.max_recv_wr);
 		goto fail_sq;
 	}
 
-	qp->rq.doorbell = qp->rq.buf;
+	if (notifier_size)
+		qp->rq.doorbell = qp->rq.buf + resp.rq_size - notifier_size;
+	else
+		qp->rq.doorbell = NULL;
 	qp->rq.index = resp.rq_idx;
 	qp->rq.buf_size = resp.rq_size;
-	qp->rq.kbuf = qp->rq.buf + page_size + resp.rvq_size;
+	qp->rq.kbuf = qp->rq.buf + resp.rvq_size;
 	qp->rq.kbuf_addr = resp.rq_phys_addr;
-	qp->rq.kbuf_len = resp.rq_size - page_size - resp.rvq_size;
-	vring_init_by_off(&qp->rq.ring, resp.num_rvqe, qp->rq.buf + page_size, resp.rvq_used_off);
+	qp->rq.kbuf_len = resp.rq_size - notifier_size - resp.rvq_size;
+	vring_init_by_off(&qp->rq.ring, resp.num_rvqe, qp->rq.buf, resp.rvq_used_off);
 	if (vring_init_pool(&qp->rq, qp->num_rqe,
 		sizeof(struct virtio_rdma_cmd_post_recv) + qp->num_rq_sge *
 		sizeof(struct virtio_rdma_sge), false))
 		goto fail_rq;
 
 	// DEBUG
-	vring_notify(&qp->sq);
-	vring_notify(&qp->rq);
+	//vring_notify(&qp->sq);
+	//vring_notify(&qp->rq);
 	printf("debug sq %s %u %u\n", (char*)qp->sq.kbuf, qp->sq.index, qp->qpn);
 	printf("debug rq %s %u\n", (char*)qp->rq.kbuf, qp->rq.index);
 
@@ -398,6 +404,28 @@ static int virtio_rdma_destroy_qp (struct ibv_qp *ibqp)
 	free(qp->sq.pool_table);
 	free(qp->rq.pool_table);
 	free(qp);
+	return 0;
+}
+
+/* send a null WQE as a doorbell */
+static int slow_doorbell(struct ibv_qp *ibqp, bool send)
+{
+	struct ibv_post_send cmd;
+	struct ib_uverbs_post_send_resp resp;
+
+	cmd.hdr.command	= send ? IB_USER_VERBS_CMD_POST_SEND :
+			  IB_USER_VERBS_CMD_POST_RECV;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.response	= (uintptr_t)&resp;
+	cmd.qp_handle	= ibqp->handle;
+	cmd.wr_count	= 0;
+	cmd.sge_count	= 0;
+	cmd.wqe_size	= sizeof(struct ibv_send_wr);
+
+	if (write(ibqp->context->cmd_fd, &cmd, sizeof(cmd)) != sizeof(cmd))
+		return errno;
+
 	return 0;
 }
 
@@ -478,7 +506,10 @@ static int	virtio_rdma_post_send (struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		wr = wr->next;
 	}
-	vring_notify(&qp->sq);
+	if (qp->sq.doorbell)
+		vring_notify(&qp->sq);
+	else
+		slow_doorbell(ibqp, true);
 
 out_err:
 	*bad_wr = wr;
@@ -525,7 +556,10 @@ static int	virtio_rdma_post_recv (struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 
 		wr = wr->next;
 	}
-	vring_notify(&qp->rq);
+	if (qp->rq.doorbell)
+		vring_notify(&qp->rq);
+	else
+		slow_doorbell(ibqp, false);
 
 out:
 	pthread_spin_unlock(&qp->rlock);
